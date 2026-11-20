@@ -7,6 +7,7 @@ import base64
 import unicodedata
 import urllib.request
 import urllib.parse
+import urllib.error
 from urllib.parse import urlparse, parse_qs
 import numpy as np
 
@@ -33,9 +34,9 @@ if "ad_in_progress" not in st.session_state:
 st.markdown(
     """
     <style>
-    /* Modern Neutral Theme Reset */
+    /* Light Ice-Cyan & High-Contrast Theme */
     .stApp {
-        background-color: #fafafa !important;
+        background-color: #f0f9ff !important;
         color: #0f172a !important;
         font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif;
     }
@@ -57,7 +58,7 @@ st.markdown(
     }
 
     .brand-subtitle {
-        color: #475569 !important;
+        color: #334155 !important;
         font-size: 0.95rem;
         font-weight: 400;
         margin-bottom: 1.75rem;
@@ -67,10 +68,10 @@ st.markdown(
     /* Crisp Minimal Cards */
     .info-card {
         background: #ffffff !important;
-        border: 1px solid #e2e8f0;
+        border: 1px solid #bae6fd;
         border-radius: 8px;
         padding: 12px 16px;
-        color: #334155 !important;
+        color: #0f172a !important;
         font-size: 0.875rem;
         font-weight: 500;
         line-height: 1.4;
@@ -120,7 +121,7 @@ st.markdown(
         background-color: #ffffff !important;
         padding: 6px;
         border-radius: 8px;
-        border: 1px solid #e2e8f0 !important;
+        border: 1px solid #bae6fd !important;
     }
 
     div[data-baseweb="radio"] label {
@@ -137,7 +138,7 @@ st.markdown(
     .stTextInput > div > div > input {
         background-color: #ffffff !important;
         color: #0f172a !important;
-        border: 1px solid #cbd5e1 !important;
+        border: 1px solid #94a3b8 !important;
         border-radius: 8px !important;
         padding: 10px 14px !important;
         font-size: 0.95rem !important;
@@ -195,14 +196,14 @@ st.markdown(
 
     .metric-badge {
         background-color: #ffffff !important;
-        border: 1px solid #e2e8f0 !important;
+        border: 1px solid #bae6fd !important;
         border-radius: 8px;
         padding: 12px;
         text-align: center;
     }
     
     .metric-label {
-        color: #64748b !important;
+        color: #475569 !important;
         font-size: 0.75rem;
         font-weight: 600;
         text-transform: uppercase;
@@ -219,7 +220,7 @@ st.markdown(
 
     .stAlert {
         background-color: #ffffff !important;
-        border: 1px solid #cbd5e1 !important;
+        border: 1px solid #94a3b8 !important;
         color: #0f172a !important;
         border-radius: 8px !important;
     }
@@ -352,6 +353,80 @@ def check_ai_markers(text: str) -> list:
             matches.append("ai tag")
 
     return list(dict.fromkeys(matches))
+
+
+def call_gemini_generate(payload: dict, api_key: str, timeout: int = 50) -> dict:
+    """Automatically selects an active multimodal Gemini model for the given API key (prevents 404 Not Found)."""
+    ctx = ssl.create_default_context() if HAS_SSL else None
+    clean_key = urllib.parse.quote(api_key.strip())
+
+    # 1. Discover available models on this API key that support generateContent
+    candidate_models = []
+    try:
+        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={clean_key}"
+        list_req = urllib.request.Request(list_url, method="GET")
+        with urllib.request.urlopen(list_req, timeout=15, context=ctx) as resp:
+            models_data = json.loads(resp.read().decode("utf-8"))
+            available = [
+                m["name"].replace("models/", "")
+                for m in models_data.get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ]
+            # Prefer modern Flash/Pro multimodal models in order
+            preferred_order = [
+                "gemini-2.5-flash",
+                "gemini-3-flash-preview",
+                "gemini-3.1-flash-lite-preview",
+                "gemini-2.5-pro",
+                "gemini-3.1-pro-preview",
+                "gemini-2.0-flash",
+                "gemini-flash-latest"
+            ]
+            for pref in preferred_order:
+                if pref in available:
+                    candidate_models.append(pref)
+            for m in available:
+                if "flash" in m and m not in candidate_models and "image" not in m and "tts" not in m:
+                    candidate_models.append(m)
+    except Exception:
+        pass
+
+    if not candidate_models:
+        candidate_models = [
+            "gemini-2.5-flash",
+            "gemini-3-flash-preview",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-flash-latest"
+        ]
+
+    last_error = None
+    for model_name in candidate_models:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={clean_key}"
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            last_error = f"HTTP {e.code} on {model_name}: {err_body[:180] or e.reason}"
+            if e.code == 404:
+                continue
+            raise RuntimeError(last_error)
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    raise RuntimeError(last_error or "No compatible Gemini models available for this API key.")
 
 
 def fetch_spotify_metadata(url: str) -> dict:
@@ -540,10 +615,7 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
 
 
 def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: str) -> dict:
-    """Uses Gemini 2.5 Flash to watch the YouTube video & verify artist/track authenticity."""
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={urllib.parse.quote(api_key.strip())}"
-    ctx = ssl.create_default_context() if HAS_SSL else None
-
+    """Uses Gemini multimodal video watching & grounded search to verify AI vs Human songs."""
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
     clean_url = normalize_youtube_url(url) if is_youtube else url
 
@@ -551,13 +623,13 @@ def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: s
     track_artist = metadata.get("artist", "")
     track_desc = metadata.get("description", "")[:1500]
 
-    # Step 1: Watch the YouTube video directly via fileData (no mimeType field allowed for YouTube URLs)
+    # Step 1: Watch the YouTube video directly via fileData
     video_notes = ""
     if is_youtube:
-        watch_prompt = f"""Watch this YouTube video and listen carefully to the singing and music from start to finish.
+        watch_prompt = """Watch this YouTube video and listen carefully to the singing and music from start to finish.
 Describe in detail:
 1. What is shown visually in the video (e.g., official live music video with real humans, static AI-generated cover art, looping AI animation, lyric visualizer)?
-2. What does the singing voice and music sound like? Listen closely for AI music generator signatures (Suno v3.5/v4, Udio, RVC voice cloning): metallic vocoder shimmer, robotic/slurred syllables, unnatural breathing, or overly compressed synthetic instruments vs. a real human studio recording.
+2. What does the singing voice and music sound like? Listen closely for AI music generator signatures (Suno, Udio, RVC voice cloning): metallic vocoder shimmer, robotic/slurred syllables, unnatural breathing, or overly compressed synthetic instruments vs. a real human studio recording.
 3. State clearly whether the audio/video shows signs of being AI-generated or human-performed."""
 
         watch_payload = {
@@ -570,18 +642,11 @@ Describe in detail:
             "generationConfig": {"temperature": 0.0}
         }
 
-        watch_req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(watch_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(watch_req, timeout=50, context=ctx) as resp:
-            raw_watch = json.loads(resp.read().decode("utf-8"))
-            for candidate in raw_watch.get("candidates", []):
-                for part in candidate.get("content", {}).get("parts", []):
-                    if "text" in part:
-                        video_notes += part["text"]
+        raw_watch = call_gemini_generate(watch_payload, api_key, timeout=55)
+        for candidate in raw_watch.get("candidates", []):
+            for part in candidate.get("content", {}).get("parts", []):
+                if "text" in part:
+                    video_notes += part["text"]
 
     # Step 2: Combine direct video/audio observation with Google Search artist/channel verification
     verdict_prompt = f"""You are a strict forensic AI music detector. Combine the direct video/audio inspection below with web search verification to determine if this song is AI-generated or a genuine human recording.
@@ -596,8 +661,8 @@ Direct Video & Audio Observation:
 
 Rules:
 - If the direct video/audio observation detected Suno/Udio/RVC vocal artifacts, slurred AI lyrics, or AI-generated video/cover imagery, set "is_ai": true.
-- If web search reveals the artist/channel is an AI music project, Suno/Udio creator, or has no real human discography/live performances outside AI uploads, set "is_ai": true.
-- Only set "is_ai": false if the track is verified as a real human artist/band recording with natural vocal and acoustic characteristics.
+- If web search reveals the artist/channel (for example "Breaking Rust" or similar AI music personas) is an AI-generated music project/artist, set "is_ai": true.
+- Only set "is_ai": false if the track is verified as a genuine human artist/band recording with natural vocal and acoustic characteristics.
 
 Return ONLY a raw JSON object (no markdown fences) with these exact keys:
 {{
@@ -614,43 +679,33 @@ Return ONLY a raw JSON object (no markdown fences) with these exact keys:
         "generationConfig": {"temperature": 0.0}
     }
 
-    verdict_req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(verdict_payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
+    raw_resp = call_gemini_generate(verdict_payload, api_key, timeout=45)
+    text_out = ""
+    for candidate in raw_resp.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            if "text" in part:
+                text_out += part["text"]
 
-    with urllib.request.urlopen(verdict_req, timeout=45, context=ctx) as resp:
-        raw_resp = json.loads(resp.read().decode("utf-8"))
-        text_out = ""
-        for candidate in raw_resp.get("candidates", []):
-            for part in candidate.get("content", {}).get("parts", []):
-                if "text" in part:
-                    text_out += part["text"]
+    json_match = re.search(r'\{.*\}', text_out, re.DOTALL)
+    if not json_match:
+        raise ValueError("Gemini returned an unreadable response format.")
 
-        json_match = re.search(r'\{.*\}', text_out, re.DOTALL)
-        if not json_match:
-            raise ValueError("Gemini returned an unreadable response format.")
-
-        parsed = json.loads(json_match.group(0))
-        prob = float(parsed.get("ai_probability", 0.5))
-        return {
-            "is_ai": bool(parsed.get("is_ai", prob > 0.5)),
-            "ai_probability": min(max(prob, 0.05), 0.99),
-            "confidence": "High",
-            "title": parsed.get("title") or track_title or "Verified Track",
-            "artist": parsed.get("artist") or track_artist or "Verified Artist",
-            "platform": platform,
-            "watched_video": bool(video_notes),
-            "reason": parsed.get("reason", "Verified via Gemini multimodal video & audio inspection.")
-        }
+    parsed = json.loads(json_match.group(0))
+    prob = float(parsed.get("ai_probability", 0.5))
+    return {
+        "is_ai": bool(parsed.get("is_ai", prob > 0.5)),
+        "ai_probability": min(max(prob, 0.05), 0.99),
+        "confidence": "High",
+        "title": parsed.get("title") or track_title or "Verified Track",
+        "artist": parsed.get("artist") or track_artist or "Verified Artist",
+        "platform": platform,
+        "watched_video": bool(video_notes),
+        "reason": parsed.get("reason", "Verified via Gemini multimodal video & audio inspection.")
+    }
 
 
 def analyze_audio_with_gemini(file_bytes: bytes, file_name: str, api_key: str) -> dict:
-    """Sends uploaded audio file directly to Gemini 2.5 Flash so the AI actually listens to the track."""
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={urllib.parse.quote(api_key.strip())}"
-
+    """Sends uploaded audio file directly to Gemini so the AI actually listens to the track."""
     ext = os.path.splitext(file_name)[1].lower()
     mime_map = {
         ".mp3": "audio/mp3",
@@ -692,33 +747,24 @@ Return ONLY a valid JSON object (no markdown fences) with these exact keys:
         "generationConfig": {"temperature": 0.0}
     }
 
-    req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    ctx = ssl.create_default_context() if HAS_SSL else None
+    raw_resp = call_gemini_generate(payload, api_key, timeout=45)
+    text_out = ""
+    for candidate in raw_resp.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            if "text" in part:
+                text_out += part["text"]
 
-    with urllib.request.urlopen(req, timeout=45, context=ctx) as resp:
-        raw_resp = json.loads(resp.read().decode("utf-8"))
-        text_out = ""
-        for candidate in raw_resp.get("candidates", []):
-            for part in candidate.get("content", {}).get("parts", []):
-                if "text" in part:
-                    text_out += part["text"]
+    json_match = re.search(r'\{.*\}', text_out, re.DOTALL)
+    if not json_match:
+        raise ValueError("Gemini returned an unreadable response format.")
 
-        json_match = re.search(r'\{.*\}', text_out, re.DOTALL)
-        if not json_match:
-            raise ValueError("Gemini returned an unreadable response format.")
-
-        parsed = json.loads(json_match.group(0))
-        prob = float(parsed.get("ai_probability", 0.5))
-        return {
-            "is_ai": bool(parsed.get("is_ai", prob > 0.5)),
-            "ai_probability": min(max(prob, 0.05), 0.99),
-            "reason": parsed.get("reason", "Analyzed directly via Gemini multimodal audio listening.")
-        }
+    parsed = json.loads(json_match.group(0))
+    prob = float(parsed.get("ai_probability", 0.5))
+    return {
+        "is_ai": bool(parsed.get("is_ai", prob > 0.5)),
+        "ai_probability": min(max(prob, 0.05), 0.99),
+        "reason": parsed.get("reason", "Analyzed directly via Gemini multimodal audio listening.")
+    }
 
 
 def analyze_audio_bytes(file_bytes: bytes, file_name: str = "audio.mp3", api_key: str = "") -> dict:
