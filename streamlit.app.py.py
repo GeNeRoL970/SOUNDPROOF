@@ -3,6 +3,7 @@ import os
 import re
 import time
 import json
+import html
 import base64
 import unicodedata
 import urllib.request
@@ -270,7 +271,8 @@ KNOWN_AI_DOMAINS = [
     "soundful.com", "musiclm.com", "aimusic.ai"
 ]
 
-AI_KEYWORDS = [
+# Explicit, unambiguous AI generator markers (avoids false positives on real songs)
+EXPLICIT_AI_KEYWORDS = [
     "suno", "suno.ai", "suno v3", "suno v3.5", "suno v4", "udio", "udio.com", 
     "generated with ai", "ai music", "ai generated", "ai-generated",
     "ai cover", "ai covers", "ai vocal", "ai voice", "ai song",
@@ -340,36 +342,38 @@ def identify_platform(url: str) -> str:
 
 
 def normalize_text(text: str) -> str:
-    """Normalizes full-width Unicode characters (e.g., ＡＩ -> AI) and lowercase."""
-    return unicodedata.normalize("NFKC", text).lower()
+    """Normalizes HTML entities, full-width Unicode characters, and lowercase."""
+    cleaned = html.unescape(text)
+    return unicodedata.normalize("NFKC", cleaned).lower()
 
 
-def check_ai_markers(text: str) -> list:
-    """Checks for AI generator keywords and standalone AI tags using strict word boundaries."""
-    norm = normalize_text(text)
+def check_ai_markers(title: str, artist: str, description: str) -> list:
+    """Checks only clean title, artist, and description for explicit AI generation tags."""
+    norm_title = normalize_text(title)
+    norm_all = normalize_text(f"{title} {artist} {description}")
     matches = []
 
-    for kw in AI_KEYWORDS:
+    for kw in EXPLICIT_AI_KEYWORDS:
         pattern = r'\b' + re.escape(kw) + r'\b'
-        if re.search(pattern, norm):
+        if re.search(pattern, norm_all):
             matches.append(kw)
 
-    if re.search(r'(?:\(|\[|#|\b)ai(?:\)|\]|\s+cover|\s+voice|\s+version|\b)', norm):
-        if "ai tag" not in matches:
-            matches.append("ai tag")
+    # Check explicit bracketed/parenthesized AI tags in the title ONLY (e.g., "(AI)", "[AI]", "(AI Cover)")
+    if re.search(r'(?:\(|\[)\s*ai(?:\s+cover|\s+version|\s+voice)?\s*(?:\)|\])', norm_title):
+        if "explicit (AI) title tag" not in matches:
+            matches.append("explicit (AI) title tag")
 
     return list(dict.fromkeys(matches))
 
 
 def verify_artist_via_public_web(artist: str, title: str) -> dict:
-    """Zero-quota fallback check using Wikipedia & DuckDuckGo instant search when Gemini API quota is exhausted."""
+    """Zero-quota fallback check using Wikipedia when Gemini API quota is exhausted."""
     if not artist or artist.lower() in ("unknown artist", "youtube channel", "unverified"):
         return {"found_ai": False, "evidence": ""}
 
     ctx = ssl.create_default_context() if HAS_SSL else None
     clean_artist = re.sub(r'\s*-\s*topic$', '', artist, flags=re.I).strip()
 
-    # Check Wikipedia API for articles describing the artist/band as AI-generated
     try:
         query = urllib.parse.quote(f'"{clean_artist}"')
         wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json&srlimit=3"
@@ -379,7 +383,7 @@ def verify_artist_via_public_web(artist: str, title: str) -> dict:
             for item in data.get("query", {}).get("search", []):
                 snippet = re.sub(r'<[^>]+>', '', item.get("snippet", "")).lower()
                 item_title = item.get("title", "").lower()
-                if clean_artist.lower() in item_title or clean_artist.lower() in snippet:
+                if clean_artist.lower() == item_title or f"{clean_artist.lower()} (" in item_title:
                     if any(term in snippet for term in ["ai-generated", "artificial intelligence", "ai music", "ai country", "suno", "udio", "virtual band", "synthetic"]):
                         return {
                             "found_ai": True,
@@ -448,22 +452,20 @@ def fetch_spotify_metadata(url: str) -> dict:
         
         with urllib.request.urlopen(req, timeout=8, context=ctx) as response:
             data = json.loads(response.read().decode('utf-8'))
-            title = data.get("title", "Spotify Track")
-            author = data.get("author_name", "Unknown Artist")
+            title = html.unescape(data.get("title", "Spotify Track"))
+            author = html.unescape(data.get("author_name", "Unknown Artist"))
             thumbnail = data.get("thumbnail_url", "")
             
             page_desc = ""
             try:
                 page_req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(page_req, timeout=6, context=ctx) as page_res:
-                    html = page_res.read().decode('utf-8', errors='ignore')
-                    desc_match = re.search(r'<meta\s+(?:property|name)=["\'](?:og:)?description["\']\s+content=["\'](.*?)["\']', html, re.I)
+                    page_html = page_res.read().decode('utf-8', errors='ignore')
+                    desc_match = re.search(r'<meta\s+(?:property|name)=["\'](?:og:)?description["\']\s+content=["\'](.*?)["\']', page_html, re.I)
                     if desc_match:
-                        page_desc = desc_match.group(1)
+                        page_desc = html.unescape(desc_match.group(1))
             except Exception:
                 pass
-
-            combined_text = f"{title} {author} {page_desc}"
 
             return {
                 "success": True,
@@ -471,7 +473,6 @@ def fetch_spotify_metadata(url: str) -> dict:
                 "artist": author,
                 "description": page_desc,
                 "thumbnail": thumbnail,
-                "raw_text": combined_text,
                 "provider": "Spotify"
             }
     except Exception:
@@ -479,12 +480,11 @@ def fetch_spotify_metadata(url: str) -> dict:
 
 
 def fetch_youtube_metadata(url: str) -> dict:
-    """Fetches YouTube track title, channel, description, tags, and synthetic content disclosures."""
+    """Fetches clean YouTube track title, channel, description, and synthetic content disclosures."""
     clean_url = normalize_youtube_url(url)
     title = ""
     author = ""
     description = ""
-    keywords_str = ""
     thumbnail = ""
     synthetic_disclosed = False
     ctx = ssl.create_default_context() if HAS_SSL else None
@@ -501,8 +501,8 @@ def fetch_youtube_metadata(url: str) -> dict:
             with urllib.request.urlopen(req, timeout=6, context=ctx) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 if data.get("title"):
-                    title = data.get("title", "")
-                    author = data.get("author_name", "")
+                    title = html.unescape(data.get("title", ""))
+                    author = html.unescape(data.get("author_name", ""))
                     thumbnail = data.get("thumbnail_url", "")
                     break
         except Exception:
@@ -518,30 +518,23 @@ def fetch_youtube_metadata(url: str) -> dict:
             }
         )
         with urllib.request.urlopen(req, timeout=8, context=ctx) as response:
-            html = response.read().decode('utf-8', errors='ignore')
+            page_html = response.read().decode('utf-8', errors='ignore')
 
             if not title:
-                t_match = re.search(r'<meta\s+name=["\']title["\']\s+content=["\'](.*?)["\']', html, re.I)
+                t_match = re.search(r'<meta\s+name=["\']title["\']\s+content=["\'](.*?)["\']', page_html, re.I)
                 if t_match:
-                    title = t_match.group(1)
+                    title = html.unescape(t_match.group(1))
 
-            desc_match = re.search(r'"shortDescription"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
+            desc_match = re.search(r'"shortDescription"\s*:\s*"((?:[^"\\]|\\.)*)"', page_html)
             if desc_match:
                 description = json.loads(f'"{desc_match.group(1)}"')
 
-            kw_match = re.search(r'"keywords"\s*:\s*\[(.*?)\]', html)
-            if kw_match:
-                keywords_str = kw_match.group(1)
-
-            if re.search(r'"isAlteredOrSyntheticContent"\s*:\s*true', html, re.I) or "altered or synthetic content" in html.lower():
+            if re.search(r'"isAlteredOrSyntheticContent"\s*:\s*true', page_html, re.I):
                 synthetic_disclosed = True
     except Exception:
         pass
 
-    if title or description or keywords_str or synthetic_disclosed:
-        combined_text = f"{title} {author} {description} {keywords_str}"
-        if synthetic_disclosed:
-            combined_text += " altered or synthetic content"
+    if title or description or synthetic_disclosed:
         return {
             "success": True,
             "title": title or "YouTube Track",
@@ -549,7 +542,6 @@ def fetch_youtube_metadata(url: str) -> dict:
             "description": description,
             "thumbnail": thumbnail,
             "synthetic_disclosed": synthetic_disclosed,
-            "raw_text": combined_text,
             "provider": "YouTube"
         }
 
@@ -569,20 +561,20 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
         ctx = ssl.create_default_context() if HAS_SSL else None
         
         with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
-            html = response.read().decode('utf-8', errors='ignore')
+            page_html = response.read().decode('utf-8', errors='ignore')
             
-            title_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']', html, re.I)
+            title_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']', page_html, re.I)
             if not title_match:
-                title_match = re.search(r'<title>(.*?)</title>', html, re.I)
-            title = title_match.group(1).strip() if title_match else f"{platform_name} Track"
+                title_match = re.search(r'<title>(.*?)</title>', page_html, re.I)
+            title = html.unescape(title_match.group(1).strip()) if title_match else f"{platform_name} Track"
 
-            desc_match = re.search(r'<meta\s+property=["\']og:description["\']\s+content=["\'](.*?)["\']', html, re.I)
+            desc_match = re.search(r'<meta\s+property=["\']og:description["\']\s+content=["\'](.*?)["\']', page_html, re.I)
             if not desc_match:
-                desc_match = re.search(r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']', html, re.I)
-            description = desc_match.group(1).strip() if desc_match else ""
+                desc_match = re.search(r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']', page_html, re.I)
+            description = html.unescape(desc_match.group(1).strip()) if desc_match else ""
 
-            artist_match = re.search(r'<meta\s+property=["\']music:musician["\']\s+content=["\'](.*?)["\']', html, re.I)
-            artist = artist_match.group(1).strip() if artist_match else ""
+            artist_match = re.search(r'<meta\s+property=["\']music:musician["\']\s+content=["\'](.*?)["\']', page_html, re.I)
+            artist = html.unescape(artist_match.group(1).strip()) if artist_match else ""
             
             if not artist and " - " in title:
                 parts = title.split(" - ")
@@ -592,10 +584,8 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
             if not artist:
                 artist = platform_name + " Creator"
 
-            img_match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\'](.*?)["\']', html, re.I)
+            img_match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\'](.*?)["\']', page_html, re.I)
             thumbnail = img_match.group(1) if img_match else ""
-
-            raw_text = f"{title} {artist} {description}"
 
             return {
                 "success": True,
@@ -603,7 +593,6 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
                 "artist": artist,
                 "description": description,
                 "thumbnail": thumbnail,
-                "raw_text": raw_text,
                 "provider": platform_name
             }
     except Exception as e:
@@ -614,13 +603,12 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
             "artist": "Unknown Artist",
             "description": "",
             "thumbnail": "",
-            "raw_text": url.lower(),
             "provider": platform_name
         }
 
 
 def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: str) -> dict:
-    """Watches a 45s YouTube video segment + grounded search verification."""
+    """Objective multimodal video watching + grounded search verification."""
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
     clean_url = normalize_youtube_url(url) if is_youtube else url
 
@@ -628,7 +616,7 @@ def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: s
     track_artist = metadata.get("artist", "")
     track_desc = metadata.get("description", "")[:1200]
 
-    prompt = f"""You are a strict forensic AI music detector. Inspect this song using the attached video/audio and Google Search to determine whether it is AI-generated or a genuine human recording.
+    prompt = f"""You are an objective forensic audio & video analyst. Watch the attached video, listen closely to the vocals and instruments, and use Google Search to verify whether this song is genuinely human-made or AI-generated (Suno, Udio, RVC voice clone, etc.).
 
 URL: {clean_url}
 Platform: {platform}
@@ -636,20 +624,22 @@ Extracted Title: {track_title}
 Extracted Artist/Channel: {track_artist}
 Description Snippet: {track_desc}
 
-Forensic Checklist:
-1. LISTEN & WATCH: Check for Suno, Udio, or RVC AI signatures (metallic vocoder shimmer, robotic pitch glides, slurred consonants, unnatural breathing, compressed synthetic instruments) and AI-generated visuals/cover art.
-2. WEB SEARCH CHECK: Search for "{track_artist}" and "{track_title}" to check if the artist is a known AI-generated music artist/persona (such as Breaking Rust, The Velvet Sundown, etc.) or an authentic human artist with real live performances.
-3. VERDICT:
-   - If the audio/video shows AI artifacts OR search indicates the artist/track is AI-generated, set "is_ai": true.
-   - Only set "is_ai": false if verified as a genuine human recording.
+Evaluation Criteria (Be accurate and balanced — do NOT falsely accuse real human artists of being AI):
+1. HUMAN-MADE INDICATORS:
+   - Real human artist, band, producer, or label with verifiable discography, live shows, credits, or authentic studio/live video footage.
+   - Natural human vocal timbre, organic breath intakes, consistent lyric pronunciation, and real acoustic/electronic production dynamics.
+   - Official music videos, behind-the-scenes footage, lyric videos, or standard YouTube auto-generated "Topic" audio tracks for real musicians.
+2. AI-GENERATED INDICATORS:
+   - Audible Suno/Udio/RVC artifacts: metallic phase-vocoder shimmer on vocals, slurred/garbled nonsensical syllables, robotic pitch glides, or unnatural breathing.
+   - Search results or credits explicitly identifying the artist/project as AI-generated (e.g., Suno, Udio, AI persona like Breaking Rust) or an AI voice cover.
 
 Return ONLY a raw JSON object (no markdown fences) with these exact keys:
 {{
   "is_ai": true or false,
-  "ai_probability": float between 0.05 and 0.99,
+  "ai_probability": float between 0.05 and 0.99 (use < 0.25 if clearly human-made, > 0.80 if clearly AI-generated),
   "title": "Exact Song Title",
   "artist": "Artist or Channel Name",
-  "reason": "Specific 2-sentence forensic report explaining what you saw/heard in the video and verified about the artist."
+  "reason": "Clear 2-sentence forensic explanation referencing what you heard in the vocals/instruments and verified about the artist."
 }}"""
 
     raw_resp = None
@@ -721,12 +711,11 @@ def analyze_audio_with_gemini(file_bytes: bytes, file_name: str, api_key: str) -
 
     audio_b64 = base64.b64encode(file_bytes[:15_000_000]).decode("utf-8")
 
-    prompt = """Listen carefully to this audio track and evaluate whether it is AI-generated (e.g., Suno, Udio, Boomy, Riffusion, or an RVC AI vocal cover) or a real human-performed/recorded song.
+    prompt = """Listen carefully to this audio track and evaluate objectively whether it is AI-generated (e.g., Suno, Udio, Boomy, Riffusion, or an RVC AI vocal cover) or a real human-performed/recorded song.
 
 Listen for:
-- Metallic/phase vocoder shimmer in vocals and high-frequency cymbals
-- Unnatural breathing, robotic pitch transitions, or slurred/garbled lyrics
-- Over-smoothed synthetic transients vs. authentic studio/live acoustics
+- Metallic/phase vocoder shimmer in vocals and high-frequency cymbals vs. clean studio/live transients
+- Natural human breathing and clear pronunciation vs. robotic pitch transitions or slurred/garbled lyrics
 
 Return ONLY a valid JSON object (no markdown fences) with these exact keys:
 {
@@ -859,7 +848,12 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
         metadata = fetch_generic_metadata(url, detected_platform)
 
     # 3. Check explicit keyword markers & YouTube's synthetic content disclosure flag
-    matched_keywords = check_ai_markers(metadata.get("raw_text", "")) if metadata.get("success") else []
+    matched_keywords = check_ai_markers(
+        metadata.get("title", ""),
+        metadata.get("artist", ""),
+        metadata.get("description", "")
+    ) if metadata.get("success") else []
+
     if metadata.get("synthetic_disclosed"):
         if "YouTube Synthetic Disclosure" not in matched_keywords:
             matched_keywords.insert(0, "YouTube Synthetic Disclosure")
@@ -868,11 +862,13 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
     if api_key and api_key.strip():
         try:
             gemini_res = analyze_link_with_gemini(url, metadata, detected_platform, api_key.strip())
-            if matched_keywords and not gemini_res["is_ai"]:
-                kw_str = ", ".join([f"'{k}'" for k in matched_keywords[:3]])
+            # Only override Gemini if YouTube officially disclosed synthetic content or an explicit generator name (Suno/Udio) was found
+            strong_overrides = [k for k in matched_keywords if k in ("YouTube Synthetic Disclosure", "suno", "udio", "suno.ai", "udio.com", "explicit (AI) title tag")]
+            if strong_overrides and not gemini_res["is_ai"]:
+                kw_str = ", ".join([f"'{k}'" for k in strong_overrides[:3]])
                 gemini_res["is_ai"] = True
-                gemini_res["ai_probability"] = max(gemini_res["ai_probability"], 0.90)
-                gemini_res["reason"] += f" Additionally, video metadata explicitly contains AI markers: {kw_str}."
+                gemini_res["ai_probability"] = max(gemini_res["ai_probability"], 0.92)
+                gemini_res["reason"] += f" Additionally, video metadata explicitly discloses AI generation: {kw_str}."
             return gemini_res
         except Exception as e:
             gemini_error = f"Gemini API error ({str(e)})."
