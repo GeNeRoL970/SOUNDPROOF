@@ -237,7 +237,7 @@ st.markdown(
 st.markdown(
     """
     <div class="info-card">
-        Real-time multimodal inspector: Gemini watches YouTube videos directly, listens to vocals & instrumentals, and inspects metadata & spectral signatures.
+        Real-time multimodal inspector: Gemini watches YouTube videos directly, listens to vocals & instrumentals, and inspects synthetic disclosure flags & spectral signatures.
     </div>
     """,
     unsafe_allow_html=True,
@@ -270,7 +270,7 @@ AI_KEYWORDS = [
     "boomy", "beatoven", "mubert", "riffusion", "musiclm", "noise2music",
     "suno ai", "udio ai", "created with suno", "created with udio",
     "soundraw", "soundful", "aiva", "amper music", "rvc", "so-vits",
-    "kits.ai", "jammable", "voicify", "weights.gg"
+    "kits.ai", "jammable", "voicify", "weights.gg", "altered or synthetic content"
 ]
 
 PLATFORM_PATTERNS = {
@@ -399,13 +399,14 @@ def fetch_spotify_metadata(url: str) -> dict:
 
 
 def fetch_youtube_metadata(url: str) -> dict:
-    """Fetches YouTube track title, channel, description, and tags."""
+    """Fetches YouTube track title, channel, description, tags, and synthetic content disclosures."""
     clean_url = normalize_youtube_url(url)
     title = ""
     author = ""
     description = ""
     keywords_str = ""
     thumbnail = ""
+    synthetic_disclosed = False
     ctx = ssl.create_default_context() if HAS_SSL else None
 
     for endpoint in [
@@ -451,17 +452,24 @@ def fetch_youtube_metadata(url: str) -> dict:
             kw_match = re.search(r'"keywords"\s*:\s*\[(.*?)\]', html)
             if kw_match:
                 keywords_str = kw_match.group(1)
+
+            # Check YouTube's official "Altered or synthetic content" disclosure flag in player JSON
+            if re.search(r'"isAlteredOrSyntheticContent"\s*:\s*true', html, re.I) or "altered or synthetic content" in html.lower():
+                synthetic_disclosed = True
     except Exception:
         pass
 
-    if title or description or keywords_str:
+    if title or description or keywords_str or synthetic_disclosed:
         combined_text = f"{title} {author} {description} {keywords_str}"
+        if synthetic_disclosed:
+            combined_text += " altered or synthetic content"
         return {
             "success": True,
             "title": title or "YouTube Track",
             "artist": author or "YouTube Channel",
             "description": description,
             "thumbnail": thumbnail,
+            "synthetic_disclosed": synthetic_disclosed,
             "raw_text": combined_text,
             "provider": "YouTube"
         }
@@ -533,7 +541,7 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
 
 
 def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: str) -> dict:
-    """Uses Gemini 2.5 Flash to directly watch YouTube videos & listen to audio."""
+    """Uses Gemini 2.5 Flash to watch the YouTube video & listen closely to the audio stream."""
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={urllib.parse.quote(api_key.strip())}"
 
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
@@ -541,9 +549,9 @@ def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: s
 
     track_title = metadata.get("title", "")
     track_artist = metadata.get("artist", "")
-    track_desc = metadata.get("description", "")[:1200]
+    track_desc = metadata.get("description", "")[:1500]
 
-    prompt = f"""You are a forensic audio & video AI detector. Watch the attached video and listen closely to the song's audio track from start to finish.
+    prompt = f"""You are a forensic audio & video AI music detector. Watch the attached video and listen critically to the entire song from start to finish.
 
 URL: {clean_url}
 Platform: {platform}
@@ -551,10 +559,16 @@ Extracted Title: {track_title}
 Extracted Artist/Channel: {track_artist}
 Extracted Description Snippet: {track_desc}
 
-Carefully inspect BOTH the audio and visuals:
-1. AUDIO FORENSICS: Listen to the singing voice, breathing, harmonies, and instruments. Does the voice have metallic RVC/AI pitch artifacts, vocoder shimmer, slurred syllables, unnatural phrasing, or Suno/Udio synthetic drum/synth textures? Or is it a genuine human vocal recording by a real artist (e.g., Bruno Mars)?
-2. VISUAL FORENSICS: Look at the video itself. Does it show AI-generated artwork, looping Midjourney/Sora animations, static AI cover images, or on-screen text mentioning AI, Suno, Udio, or AI Cover? Or is it an official music video / live performance / official topic audio?
-3. METADATA CHECK: Check if the title, channel, or description indicates an AI song or AI cover.
+DO NOT assume a song is human-made just because the title doesn't say "AI". Many AI songs from Suno v3.5/v4 and Udio are uploaded with normal song titles and AI-generated cover art or looping animations.
+
+Inspect EVERY clue in the video and audio:
+1. VOCAL & INSTRUMENTAL FORENSICS (Listen closely):
+   - Listen for Suno/Udio signatures: metallic phase-vocoder shimmer on vocals, slightly robotic/auto-tuned pitch glides, unnatural breathless phrasing, slurred consonants, or compressed/washy high-frequency cymbals and synths.
+   - Compare against authentic human studio recordings (like Bruno Mars, Taylor Swift, real bands) which have crisp transient punch, natural room acoustics, and organic vocal dynamics.
+2. VISUAL FORENSICS (Watch the video):
+   - Is the video a static AI-generated illustration/portrait (Midjourney/DALL-E style), a subtle looping AI animation (Kling/Runway/Sora), or a generic visualizer typical of Suno/Udio uploads?
+3. METADATA & ARTIST CHECK:
+   - Look at the channel name, description, and style.
 
 Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
 {{
@@ -562,13 +576,17 @@ Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
   "ai_probability": float between 0.05 and 0.99,
   "title": "Exact Song Title",
   "artist": "Artist or Channel Name",
-  "reason": "Specific 2-sentence forensic report explaining what you saw in the video visuals and heard in the vocals/instruments."
+  "reason": "Specific 2-sentence forensic report detailing what you heard in the vocal/instrumental audio texture and what you saw in the video visuals."
 }}"""
 
     parts = []
     if is_youtube:
-        # Canonical YouTube URL in fileData makes Gemini actually ingest & watch the video + audio
-        parts.append({"fileData": {"fileUri": clean_url}})
+        parts.append({
+            "fileData": {
+                "mimeType": "video/mp4",
+                "fileUri": clean_url
+            }
+        })
     parts.append({"text": prompt})
 
     payload = {
@@ -576,7 +594,6 @@ Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
         "generationConfig": {"temperature": 0.0}
     }
 
-    # Only attach google_search for non-YouTube links so it doesn't override direct YouTube video watching
     if not is_youtube:
         payload["tools"] = [{"google_search": {}}]
 
@@ -588,7 +605,7 @@ Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
     )
     ctx = ssl.create_default_context() if HAS_SSL else None
 
-    with urllib.request.urlopen(req, timeout=45, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=50, context=ctx) as resp:
         raw_resp = json.loads(resp.read().decode("utf-8"))
         text_out = ""
         for candidate in raw_resp.get("candidates", []):
@@ -774,8 +791,11 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
     else:
         metadata = fetch_generic_metadata(url, detected_platform)
 
-    # 3. Check explicit keyword markers in metadata
+    # 3. Check explicit keyword markers & YouTube's synthetic content disclosure flag
     matched_keywords = check_ai_markers(metadata.get("raw_text", "")) if metadata.get("success") else []
+    if metadata.get("synthetic_disclosed"):
+        if "YouTube Synthetic Disclosure" not in matched_keywords:
+            matched_keywords.insert(0, "YouTube Synthetic Disclosure")
 
     # 4. If Gemini API Key is provided, watch the video & listen to the audio stream
     if api_key and api_key.strip():
@@ -784,8 +804,8 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
             if matched_keywords and not gemini_res["is_ai"]:
                 kw_str = ", ".join([f"'{k}'" for k in matched_keywords[:3]])
                 gemini_res["is_ai"] = True
-                gemini_res["ai_probability"] = max(gemini_res["ai_probability"], 0.88)
-                gemini_res["reason"] += f" Additionally, track metadata explicitly contains AI markers: {kw_str}."
+                gemini_res["ai_probability"] = max(gemini_res["ai_probability"], 0.90)
+                gemini_res["reason"] += f" Additionally, video metadata explicitly contains AI markers: {kw_str}."
             return gemini_res
         except Exception as e:
             gemini_error = f"Gemini API error ({str(e)}). Falling back to metadata inspection: "
