@@ -7,7 +7,7 @@ import base64
 import unicodedata
 import urllib.request
 import urllib.parse
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import numpy as np
 
 # Safe import for SSL / standard networking
@@ -230,14 +230,14 @@ st.markdown(
 
 st.markdown('<div class="brand-title">SOUNDPROOF</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="brand-subtitle">Perform real-time multimodal AI audio & metadata detection on songs from Spotify, YouTube, SoundCloud, Apple Music, and uploaded files.</div>',
+    '<div class="brand-subtitle">Perform real-time multimodal AI video & audio detection on songs from YouTube, Spotify, SoundCloud, Apple Music, and uploaded files.</div>',
     unsafe_allow_html=True,
 )
 
 st.markdown(
     """
     <div class="info-card">
-        Real-time multimodal inspector: Combines Gemini acoustic listening, live streaming metadata, artist tags, and FFT spectral analysis.
+        Real-time multimodal inspector: Gemini watches YouTube videos directly, listens to vocals & instrumentals, and inspects metadata & spectral signatures.
     </div>
     """,
     unsafe_allow_html=True,
@@ -251,7 +251,7 @@ except Exception:
     default_gemini_key = os.environ.get("GEMINI_API_KEY", "")
 
 gemini_api_key = st.text_input(
-    "Gemini API Key (Enables active audio listening & deep web search)",
+    "Gemini API Key (Required for AI to watch videos & listen to audio)",
     value=default_gemini_key,
     type="password",
     placeholder="AIzaSy...",
@@ -297,6 +297,27 @@ def is_valid_url(url: str) -> bool:
     return True
 
 
+def normalize_youtube_url(url: str) -> str:
+    """Converts any YouTube / youtu.be / Shorts / Music link into clean canonical watch?v=ID format for Gemini."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    video_id = None
+
+    if "youtu.be" in host:
+        video_id = parsed.path.lstrip("/").split("/")[0]
+    elif "youtube.com" in host:
+        if parsed.path == "/watch":
+            video_id = parse_qs(parsed.query).get("v", [None])[0]
+        elif parsed.path.startswith("/shorts/"):
+            video_id = parsed.path.split("/shorts/")[1].split("/")[0]
+        elif parsed.path.startswith("/embed/"):
+            video_id = parsed.path.split("/embed/")[1].split("/")[0]
+
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return url
+
+
 def identify_platform(url: str) -> str:
     """Identifies the music service platform from the URL structure."""
     domain = urlparse(url).netloc.lower()
@@ -326,7 +347,6 @@ def check_ai_markers(text: str) -> list:
         if re.search(pattern, norm):
             matches.append(kw)
 
-    # Check standalone AI tags like "(AI)", "[AI]", "#AI", "AI Cover"
     if re.search(r'(?:\(|\[|#|\b)ai(?:\)|\]|\s+cover|\s+voice|\s+version|\b)', norm):
         if "ai tag" not in matches:
             matches.append("ai tag")
@@ -380,6 +400,7 @@ def fetch_spotify_metadata(url: str) -> dict:
 
 def fetch_youtube_metadata(url: str) -> dict:
     """Fetches YouTube track title, channel, description, and tags."""
+    clean_url = normalize_youtube_url(url)
     title = ""
     author = ""
     description = ""
@@ -387,10 +408,9 @@ def fetch_youtube_metadata(url: str) -> dict:
     thumbnail = ""
     ctx = ssl.create_default_context() if HAS_SSL else None
 
-    # 1. Fetch clean Title & Author from oEmbed / noembed
     for endpoint in [
-        f"https://www.youtube.com/oembed?url={urllib.parse.quote(url, safe='')}&format=json",
-        f"https://noembed.com/embed?url={urllib.parse.quote(url, safe='')}"
+        f"https://www.youtube.com/oembed?url={urllib.parse.quote(clean_url, safe='')}&format=json",
+        f"https://noembed.com/embed?url={urllib.parse.quote(clean_url, safe='')}"
     ]:
         try:
             req = urllib.request.Request(
@@ -407,10 +427,9 @@ def fetch_youtube_metadata(url: str) -> dict:
         except Exception:
             continue
 
-    # 2. Fetch full YouTube watch HTML with consent cookie for description & tags
     try:
         req = urllib.request.Request(
-            url,
+            clean_url,
             headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
@@ -447,7 +466,7 @@ def fetch_youtube_metadata(url: str) -> dict:
             "provider": "YouTube"
         }
 
-    return fetch_generic_metadata(url, "YouTube")
+    return fetch_generic_metadata(clean_url, "YouTube")
 
 
 def fetch_generic_metadata(url: str, platform_name: str) -> dict:
@@ -514,44 +533,52 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
 
 
 def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: str) -> dict:
-    """Uses Gemini 2.5 Flash to listen to YouTube audio/video directly and verify via Google Search."""
+    """Uses Gemini 2.5 Flash to directly watch YouTube videos & listen to audio."""
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={urllib.parse.quote(api_key.strip())}"
+
+    is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    clean_url = normalize_youtube_url(url) if is_youtube else url
 
     track_title = metadata.get("title", "")
     track_artist = metadata.get("artist", "")
     track_desc = metadata.get("description", "")[:1200]
 
-    prompt = f"""Analyze this music link to determine whether the song is AI-generated (including Suno, Udio, Boomy, Riffusion, or AI voice covers / RVC) or a real human-performed/produced track.
+    prompt = f"""You are a forensic audio & video AI detector. Watch the attached video and listen closely to the song's audio track from start to finish.
 
-URL: {url}
+URL: {clean_url}
 Platform: {platform}
 Extracted Title: {track_title}
 Extracted Artist/Channel: {track_artist}
 Extracted Description Snippet: {track_desc}
 
-Instructions:
-1. If audio/video is attached from YouTube, actively LISTEN to the vocals, instruments, breathing, phrasing, and production artifacts for synthetic/AI signatures.
-2. Also check the title, artist, channel, and search results to see if this is an official release by a real artist (like Bruno Mars, Taylor Swift, etc.) or an AI-generated song / AI cover.
-3. Return ONLY a valid JSON object (no markdown fences) with these exact keys:
+Carefully inspect BOTH the audio and visuals:
+1. AUDIO FORENSICS: Listen to the singing voice, breathing, harmonies, and instruments. Does the voice have metallic RVC/AI pitch artifacts, vocoder shimmer, slurred syllables, unnatural phrasing, or Suno/Udio synthetic drum/synth textures? Or is it a genuine human vocal recording by a real artist (e.g., Bruno Mars)?
+2. VISUAL FORENSICS: Look at the video itself. Does it show AI-generated artwork, looping Midjourney/Sora animations, static AI cover images, or on-screen text mentioning AI, Suno, Udio, or AI Cover? Or is it an official music video / live performance / official topic audio?
+3. METADATA CHECK: Check if the title, channel, or description indicates an AI song or AI cover.
+
+Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
 {{
   "is_ai": true or false,
   "ai_probability": float between 0.05 and 0.99,
   "title": "Exact Song Title",
   "artist": "Artist or Channel Name",
-  "reason": "Clear 1-2 sentence explanation referencing what you heard in the audio and found in metadata/search."
+  "reason": "Specific 2-sentence forensic report explaining what you saw in the video visuals and heard in the vocals/instruments."
 }}"""
 
     parts = []
-    # Pass YouTube URL directly via fileData so Gemini processes the audio & video stream
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        parts.append({"fileData": {"fileUri": url}})
+    if is_youtube:
+        # Canonical YouTube URL in fileData makes Gemini actually ingest & watch the video + audio
+        parts.append({"fileData": {"fileUri": clean_url}})
     parts.append({"text": prompt})
 
     payload = {
         "contents": [{"parts": parts}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.1}
+        "generationConfig": {"temperature": 0.0}
     }
+
+    # Only attach google_search for non-YouTube links so it doesn't override direct YouTube video watching
+    if not is_youtube:
+        payload["tools"] = [{"google_search": {}}]
 
     req = urllib.request.Request(
         endpoint,
@@ -561,7 +588,7 @@ Instructions:
     )
     ctx = ssl.create_default_context() if HAS_SSL else None
 
-    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=45, context=ctx) as resp:
         raw_resp = json.loads(resp.read().decode("utf-8"))
         text_out = ""
         for candidate in raw_resp.get("candidates", []):
@@ -582,7 +609,7 @@ Instructions:
             "title": parsed.get("title") or track_title or "Verified Track",
             "artist": parsed.get("artist") or track_artist or "Verified Artist",
             "platform": platform,
-            "reason": parsed.get("reason", "Verified via Gemini multimodal audio & search analysis.")
+            "reason": parsed.get("reason", "Verified via Gemini multimodal video & audio inspection.")
         }
 
 
@@ -600,7 +627,6 @@ def analyze_audio_with_gemini(file_bytes: bytes, file_name: str, api_key: str) -
     }
     mime_type = mime_map.get(ext, "audio/mp3")
 
-    # Cap inline payload at ~15MB to stay safely under API request size limits
     audio_b64 = base64.b64encode(file_bytes[:15_000_000]).decode("utf-8")
 
     prompt = """Listen carefully to this audio track and evaluate whether it is AI-generated (e.g., Suno, Udio, Boomy, Riffusion, or an RVC AI vocal cover) or a real human-performed/recorded song.
@@ -629,7 +655,7 @@ Return ONLY a valid JSON object (no markdown fences) with these exact keys:
                 {"text": prompt}
             ]
         }],
-        "generationConfig": {"temperature": 0.1}
+        "generationConfig": {"temperature": 0.0}
     }
 
     req = urllib.request.Request(
@@ -640,7 +666,7 @@ Return ONLY a valid JSON object (no markdown fences) with these exact keys:
     )
     ctx = ssl.create_default_context() if HAS_SSL else None
 
-    with urllib.request.urlopen(req, timeout=35, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=45, context=ctx) as resp:
         raw_resp = json.loads(resp.read().decode("utf-8"))
         text_out = ""
         for candidate in raw_resp.get("candidates", []):
@@ -692,7 +718,6 @@ def analyze_audio_bytes(file_bytes: bytes, file_name: str = "audio.mp3", api_key
     except Exception:
         pass
 
-    # If Gemini API Key is provided, listen to the actual audio file
     if api_key and api_key.strip():
         try:
             gemini_res = analyze_audio_with_gemini(file_bytes, file_name, api_key.strip())
@@ -722,7 +747,7 @@ def analyze_audio_bytes(file_bytes: bytes, file_name: str = "audio.mp3", api_key
 
 
 def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> dict:
-    """Fetches real track data and executes Gemini multimodal listening + keyword analysis."""
+    """Fetches real track data and executes Gemini multimodal video watching + keyword analysis."""
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
     detected_platform = identify_platform(url) if selected_app == "Auto-Detect Platform" else selected_app
@@ -741,7 +766,7 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
                 "thumbnail": ""
             }
 
-    # 2. Fetch real metadata first so Gemini & keyword checks have exact song title, artist & description
+    # 2. Fetch real metadata first
     if "spotify.com" in domain or selected_app == "Spotify":
         metadata = fetch_spotify_metadata(url)
     elif "youtube.com" in domain or "youtu.be" in domain or selected_app == "YouTube":
@@ -752,7 +777,7 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
     # 3. Check explicit keyword markers in metadata
     matched_keywords = check_ai_markers(metadata.get("raw_text", "")) if metadata.get("success") else []
 
-    # 4. If Gemini API Key is provided, listen to the link audio & run grounded search verification
+    # 4. If Gemini API Key is provided, watch the video & listen to the audio stream
     if api_key and api_key.strip():
         try:
             gemini_res = analyze_link_with_gemini(url, metadata, detected_platform, api_key.strip())
@@ -820,7 +845,7 @@ if input_type == "Streaming Link":
     )
     user_input = st.text_input(
         "Paste Song Link",
-        placeholder="e.g. https://open.spotify.com/track/... or https://www.youtube.com/watch?v=...",
+        placeholder="e.g. https://www.youtube.com/watch?v=... or https://open.spotify.com/track/...",
     )
 else:
     uploaded_file = st.file_uploader(
@@ -880,7 +905,7 @@ if st.session_state.ad_watched:
     if input_type == "Streaming Link":
         link = user_input.strip()
 
-        with st.spinner("Listening to audio stream, inspecting metadata, and verifying track..."):
+        with st.spinner("Watching video, listening to audio stream, and inspecting metadata..."):
             res = inspect_universal_link(link, selected_platform, gemini_api_key)
 
         st.markdown("### Analysis Report")
