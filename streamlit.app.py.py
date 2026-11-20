@@ -194,6 +194,12 @@ st.markdown(
         color: #166534 !important;
     }
 
+    .result-unverified {
+        background: #fffbeb !important;
+        border: 1px solid #fde68a !important;
+        color: #92400e !important;
+    }
+
     .metric-badge {
         background-color: #ffffff !important;
         border: 1px solid #bae6fd !important;
@@ -356,18 +362,16 @@ def check_ai_markers(text: str) -> list:
 
 
 def call_gemini_generate(payload: dict, api_key: str, timeout: int = 55) -> dict:
-    """Tries free-tier-friendly multimodal Gemini models in order, rotating on 404 or 429 quota limits."""
+    """Tries free-tier-friendly multimodal Gemini models in order, rotating on 400/404/429 limits."""
     ctx = ssl.create_default_context() if HAS_SSL else None
     clean_key = urllib.parse.quote(api_key.strip())
 
-    # Prioritize stable models with higher free-tier RPM/RPD limits before preview models
     candidate_models = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
         "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-2.5-pro",
         "gemini-flash-latest"
     ]
 
@@ -390,8 +394,7 @@ def call_gemini_generate(payload: dict, api_key: str, timeout: int = 55) -> dict
             except Exception:
                 pass
             last_error = f"HTTP {e.code} on {model_name}: {err_body[:160] or e.reason}"
-            # Rotate to the next model if 404 (not found) or 429 (quota/rate limit on that specific model)
-            if e.code in (404, 429):
+            if e.code in (400, 404, 429):
                 continue
             raise RuntimeError(last_error)
         except Exception as e:
@@ -587,15 +590,15 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
 
 
 def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: str) -> dict:
-    """Single-call Gemini multimodal video watching + grounded search verification (conserves API quota)."""
+    """Watches a 45s YouTube video segment (low token footprint for free-tier keys) + grounded search."""
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
     clean_url = normalize_youtube_url(url) if is_youtube else url
 
     track_title = metadata.get("title", "")
     track_artist = metadata.get("artist", "")
-    track_desc = metadata.get("description", "")[:1500]
+    track_desc = metadata.get("description", "")[:1200]
 
-    prompt = f"""You are a strict forensic AI music detector. Watch the attached video, listen closely to the singing and music, and verify the artist/song via search to determine if this track is AI-generated or a genuine human recording.
+    prompt = f"""You are a strict forensic AI music detector. Inspect this song using the attached video/audio and Google Search to determine whether it is AI-generated or a genuine human recording.
 
 URL: {clean_url}
 Platform: {platform}
@@ -604,33 +607,53 @@ Extracted Artist/Channel: {track_artist}
 Description Snippet: {track_desc}
 
 Forensic Checklist:
-1. WATCH & LISTEN TO THE VIDEO: Listen for Suno, Udio, or RVC AI voice cloning signatures (metallic vocoder shimmer, robotic pitch glides, slurred consonants, unnatural breathing, or compressed synthetic instruments) and look for AI-generated cover art or looping AI animations.
-2. ARTIST & TRACK VERIFICATION: Check whether the artist/channel (for example "Breaking Rust" or similar AI music personas) is a known AI music project/artist or has no verified human performer behind it.
-3. VERDICT RULES:
-   - If the video/audio shows Suno/Udio/RVC artifacts, AI visuals, OR the artist is an AI music project, set "is_ai": true.
-   - Only set "is_ai": false if it is a verified genuine human artist/band recording.
+1. LISTEN & WATCH: Check for Suno, Udio, or RVC AI signatures (metallic vocoder shimmer, robotic pitch glides, slurred consonants, unnatural breathing, compressed synthetic instruments) and AI-generated visuals/cover art.
+2. WEB SEARCH CHECK: Search for "{track_artist}" and "{track_title}" to check if the artist is a known AI-generated music artist/persona (such as Breaking Rust, The Velvet Sundown, etc.) or an authentic human artist with real live performances.
+3. VERDICT:
+   - If the audio/video shows AI artifacts OR search indicates the artist/track is AI-generated, set "is_ai": true.
+   - Only set "is_ai": false if verified as a genuine human recording.
 
-Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
+Return ONLY a raw JSON object (no markdown fences) with these exact keys:
 {{
   "is_ai": true or false,
   "ai_probability": float between 0.05 and 0.99,
   "title": "Exact Song Title",
   "artist": "Artist or Channel Name",
-  "reason": "Specific 2-sentence forensic report explaining what you saw in the video, heard in the vocals/instruments, and found about the artist."
+  "reason": "Specific 2-sentence forensic report explaining what you saw/heard in the video and verified about the artist."
 }}"""
 
-    parts = []
+    raw_resp = None
+    watched_video = False
+
+    # Attempt 1: Watch first 45 seconds of YouTube video (keeps token usage ~12k so free tier doesn't 429) + Google Search
     if is_youtube:
-        parts.append({"fileData": {"fileUri": clean_url}})
-    parts.append({"text": prompt})
+        video_parts = [
+            {
+                "fileData": {"fileUri": clean_url},
+                "videoMetadata": {"startOffset": "0s", "endOffset": "45s"}
+            },
+            {"text": prompt}
+        ]
+        video_payload = {
+            "contents": [{"parts": video_parts}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {"temperature": 0.0}
+        }
+        try:
+            raw_resp = call_gemini_generate(video_payload, api_key, timeout=55)
+            watched_video = True
+        except Exception:
+            raw_resp = None
 
-    payload = {
-        "contents": [{"parts": parts}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.0}
-    }
+    # Attempt 2: If video token quota was exceeded or non-YouTube URL, run lightweight grounded search verification
+    if raw_resp is None:
+        search_payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {"temperature": 0.0}
+        }
+        raw_resp = call_gemini_generate(search_payload, api_key, timeout=40)
 
-    raw_resp = call_gemini_generate(payload, api_key, timeout=55)
     text_out = ""
     for candidate in raw_resp.get("candidates", []):
         for part in candidate.get("content", {}).get("parts", []):
@@ -643,14 +666,16 @@ Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
 
     parsed = json.loads(json_match.group(0))
     prob = float(parsed.get("ai_probability", 0.5))
+    mode_tag = "[Video + Audio Watched] " if watched_video else "[Search + Metadata Verified] "
     return {
         "is_ai": bool(parsed.get("is_ai", prob > 0.5)),
         "ai_probability": min(max(prob, 0.05), 0.99),
         "confidence": "High",
+        "unverified": False,
         "title": parsed.get("title") or track_title or "Verified Track",
         "artist": parsed.get("artist") or track_artist or "Verified Artist",
         "platform": platform,
-        "reason": parsed.get("reason", "Verified via Gemini multimodal video & audio inspection.")
+        "reason": mode_tag + parsed.get("reason", "Verified via Gemini multimodal inspection.")
     }
 
 
@@ -789,6 +814,7 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
                 "is_ai": True,
                 "confidence": "Very High",
                 "ai_probability": 0.98,
+                "unverified": False,
                 "reason": f"Direct link from recognized AI music generation platform ({ai_domain}).",
                 "title": f"Generative Track ({ai_domain})",
                 "artist": "AI Music Engine",
@@ -821,11 +847,11 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
                 gemini_res["reason"] += f" Additionally, video metadata explicitly contains AI markers: {kw_str}."
             return gemini_res
         except Exception as e:
-            gemini_error = f"Gemini API error ({str(e)}). Falling back to metadata inspection: "
+            gemini_error = f"Gemini API error ({str(e)})."
     else:
         gemini_error = ""
 
-    # 5. Fallback metadata evaluation
+    # 5. Fallback metadata evaluation (only flags AI if explicit markers exist; otherwise marks Unverified if API failed)
     if metadata.get("success", False):
         if matched_keywords:
             kw_str = ", ".join([f"'{k}'" for k in matched_keywords[:3]])
@@ -833,7 +859,20 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
                 "is_ai": True,
                 "confidence": "High",
                 "ai_probability": 0.92,
-                "reason": f"{gemini_error}Live inspection on {metadata.get('provider', detected_platform)} found generative markers: {kw_str}.",
+                "unverified": False,
+                "reason": f"{gemini_error} Live inspection on {metadata.get('provider', detected_platform)} found generative markers: {kw_str}.",
+                "title": metadata.get("title", "Track Detected"),
+                "artist": metadata.get("artist", "Artist Detected"),
+                "platform": metadata.get("provider", detected_platform),
+                "thumbnail": metadata.get("thumbnail", "")
+            }
+        elif gemini_error:
+            return {
+                "is_ai": False,
+                "confidence": "Low",
+                "ai_probability": 0.50,
+                "unverified": True,
+                "reason": f"{gemini_error} Metadata alone had no explicit 'AI' tags, so deep audio/video verification could not complete.",
                 "title": metadata.get("title", "Track Detected"),
                 "artist": metadata.get("artist", "Artist Detected"),
                 "platform": metadata.get("provider", detected_platform),
@@ -842,9 +881,10 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
         else:
             return {
                 "is_ai": False,
-                "confidence": "High" if not gemini_error else "Low",
-                "ai_probability": 0.12,
-                "reason": f"{gemini_error}Live inspection of track metadata on {metadata.get('provider', detected_platform)} found no AI markers.",
+                "confidence": "Medium",
+                "ai_probability": 0.15,
+                "unverified": False,
+                "reason": f"Metadata inspection on {metadata.get('provider', detected_platform)} found no AI markers. Enter a Gemini API key to watch & listen to the audio stream.",
                 "title": metadata.get("title", "Track Detected"),
                 "artist": metadata.get("artist", "Artist Detected"),
                 "platform": metadata.get("provider", detected_platform),
@@ -855,7 +895,8 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
         "is_ai": False,
         "confidence": "Low",
         "ai_probability": 0.50,
-        "reason": f"{gemini_error}Could not fetch track metadata from {detected_platform}. Enter a valid Gemini API key or upload the audio file directly.",
+        "unverified": True,
+        "reason": f"{gemini_error} Could not fetch track metadata from {detected_platform}. Enter a valid Gemini API key or upload the audio file directly.",
         "title": detected_platform + " Track",
         "artist": "Unverified",
         "platform": detected_platform,
@@ -943,7 +984,12 @@ if st.session_state.ad_watched:
 
         st.markdown("### Analysis Report")
         
-        if res["is_ai"]:
+        if res.get("unverified"):
+            st.markdown(
+                '<div class="result-banner result-unverified">Unverified Track (Deep AI Check Incomplete)</div>',
+                unsafe_allow_html=True
+            )
+        elif res["is_ai"]:
             st.markdown(
                 f'<div class="result-banner result-ai">Likely AI-Generated Track ({int(res["ai_probability"] * 100)}% AI Confidence)</div>',
                 unsafe_allow_html=True
@@ -970,55 +1016,4 @@ if st.session_state.ad_watched:
             </div>
             """, unsafe_allow_html=True)
         with col3:
-            st.markdown(f"""
-            <div class="metric-badge">
-                <div class="metric-label">Artist / Channel</div>
-                <div class="metric-value">{res.get('artist', 'Unknown Artist')}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown('<div style="margin-top: 15px;"></div>', unsafe_allow_html=True)
-        st.info(f"Verification Details: {res['reason']}")
-
-    else:
-        with st.spinner("Listening to uploaded audio and computing spectral metrics..."):
-            file_bytes = uploaded_file.read()
-            res = analyze_audio_bytes(file_bytes, uploaded_file.name, gemini_api_key)
-
-        st.markdown("### Analysis Report")
-        
-        if res["is_ai"]:
-            st.markdown(
-                f'<div class="result-banner result-ai">Likely AI-Generated Track ({int(res["ai_probability"] * 100)}% Probability)</div>',
-                unsafe_allow_html=True
-            )
-        else:
-            st.markdown(
-                f'<div class="result-banner result-human">Likely Human-Made Track ({int((1 - res["ai_probability"]) * 100)}% Human Confidence)</div>',
-                unsafe_allow_html=True
-            )
-
-        if res.get("reason"):
-            st.info(f"Verification Details: {res['reason']}")
-
-        if res.get("metrics"):
-            st.markdown("##### Acoustic Spectral Metrics")
-            m_cols = st.columns(len(res["metrics"]))
-            for idx, (k, v) in enumerate(res["metrics"].items()):
-                with m_cols[idx]:
-                    st.markdown(f"""
-                    <div class="metric-badge">
-                        <div class="metric-label">{k}</div>
-                        <div class="metric-value">{v}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            st.markdown('<div style="margin-top: 12px;"></div>', unsafe_allow_html=True)
-            with st.expander("Metric descriptions"):
-                st.markdown("""
-- **Spectral Flatness:** Evaluates tonal variation against static noise. Scores over `0.048` typically indicate synthetic noise artifacts.
-- **High-Freq Energy:** Measures the ratio of total energy in treble frequencies (> `0.18` signals synthetic high-frequency noise).
-- **Signal Variance:** Dynamic range variation. Low values (< `450`) indicate heavily flattened digital sound dynamics.
-                """)
-
-    st.session_state.ad_watched = False
+            st.markdown
