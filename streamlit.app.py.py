@@ -252,6 +252,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Gemini API Key Configuration (supports st.secrets, env var, or direct UI input)
+default_gemini_key = os.environ.get("GEMINI_API_KEY", "")
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        default_gemini_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    pass
+
+gemini_api_key = st.text_input(
+    "Gemini API Key (Optional — Enables Deep AI Link Investigation)",
+    value=default_gemini_key,
+    type="password",
+    placeholder="AIzaSy...",
+    help="Enter a Google Gemini API key to allow Gemini AI to search and inspect the song link directly."
+)
+
 KNOWN_AI_DOMAINS = [
     "suno.com", "suno.ai", "udio.com", "beatoven.ai", 
     "boomy.com", "mubert.com", "riffusion.com", "soundraw.io",
@@ -452,75 +468,6 @@ def fetch_youtube_metadata(url: str) -> dict:
         "provider": "YouTube"
     }
 
-    # 1. Fetch clean Title, Author, and Thumbnail via oEmbed
-    try:
-        clean_url = url.split("?si=")[0].split("&si=")[0]
-        encoded_url = urllib.parse.quote(clean_url, safe='')
-        oembed_endpoint = f"https://www.youtube.com/oembed?url={encoded_url}&format=json"
-        req = urllib.request.Request(oembed_endpoint, headers=headers)
-        with urllib.request.urlopen(req, timeout=8, context=ctx) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            title = data.get("title", title)
-            author = data.get("author_name", author)
-            thumbnail = data.get("thumbnail_url", "")
-    except Exception:
-        pass
-
-    # 2. Fetch full YouTube watch page to extract full Description & Video Tags
-    try:
-        video_id = ""
-        parsed = urlparse(url)
-        if "youtu.be" in parsed.netloc:
-            video_id = parsed.path.lstrip('/').split('/')[0]
-        elif "youtube.com" in parsed.netloc:
-            video_id = parse_qs(parsed.query).get("v", [""])[0]
-            
-        watch_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else url
-        page_req = urllib.request.Request(watch_url, headers=headers)
-        
-        with urllib.request.urlopen(page_req, timeout=10, context=ctx) as page_res:
-            html = page_res.read().decode('utf-8', errors='ignore')
-            
-            # Extract full JSON description inside ytInitialPlayerResponse
-            desc_json_match = re.search(r'"shortDescription":"(.*?)"', html)
-            if desc_json_match:
-                description = desc_json_match.group(1).replace('\\n', ' ')
-            else:
-                meta_desc = re.search(r'<meta name="description" content="(.*?)"', html)
-                if meta_desc:
-                    description = meta_desc.group(1)
-
-            # Extract video tags array
-            keywords_json_match = re.search(r'"keywords":\[(.*?)\]', html)
-            if keywords_json_match:
-                keywords = keywords_json_match.group(1).replace('"', ' ')
-                
-            if title == "YouTube Track":
-                t_match = re.search(r'<title>(.*?)</title>', html)
-                if t_match:
-                    title = t_match.group(1).replace(" - YouTube", "")
-
-        combined_text = f"{title} {author} {description} {keywords}".lower()
-        return {
-            "success": True,
-            "title": title,
-            "artist": author,
-            "thumbnail": thumbnail,
-            "raw_text": combined_text,
-            "provider": "YouTube"
-        }
-    except Exception:
-        if title != "YouTube Track":
-            return {
-                "success": True,
-                "title": title,
-                "artist": author,
-                "thumbnail": thumbnail,
-                "raw_text": f"{title} {author}".lower(),
-                "provider": "YouTube"
-            }
-        return fetch_generic_metadata(url, "YouTube")
-
 def fetch_generic_metadata(url: str, platform_name: str) -> dict:
     """Fetches real HTML OpenGraph and meta tags for Apple Music, SoundCloud, Tidal, Deezer, etc."""
     try:
@@ -633,7 +580,66 @@ def analyze_audio_bytes(file_bytes: bytes) -> dict:
             "error": str(e)
         }
 
-def inspect_universal_link(url: str, selected_app: str) -> dict:
+def analyze_with_gemini(url: str, platform_name: str, api_key: str) -> dict:
+    """Uses Gemini API with Google Search grounding to investigate the URL and detect AI music."""
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={urllib.parse.quote(api_key.strip())}"
+    
+    prompt = (
+        f"Investigate this music link ({url}) on {platform_name}. "
+        "Search for the exact video/song title, channel/artist name, description, and public info about this track. "
+        "Determine if this song, cover, or vocals were generated or modified using AI (such as Suno, Udio, RVC AI voice covers, Boomy, Riffusion, etc.) or if it is an authentic human-made recording. "
+        "Respond ONLY with a valid JSON object using this exact schema (no markdown formatting): "
+        '{"is_ai": true or false, "ai_probability": 0.0 to 1.0, "confidence": "High" or "Medium" or "Low", '
+        '"title": "Song Title", "artist": "Artist or Channel Name", "reason": "Clear 1-2 sentence explanation of what you found."}'
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.1}
+    }
+
+    try:
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        ctx = ssl.create_default_context() if HAS_SSL else None
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as response:
+            resp_data = json.loads(response.read().decode("utf-8"))
+            candidates = resp_data.get("candidates", [])
+            if not candidates:
+                return {"success": False, "error": "No response returned from Gemini API."}
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            raw_reply = "".join([p.get("text", "") for p in parts]).strip()
+            
+            # Extract JSON block cleanly
+            json_match = re.search(r'\{.*\}', raw_reply, re.DOTALL)
+            if not json_match:
+                return {"success": False, "error": "Could not parse structured verdict from Gemini."}
+                
+            parsed_verdict = json.loads(json_match.group(0))
+            prob = float(parsed_verdict.get("ai_probability", 0.85 if parsed_verdict.get("is_ai") else 0.15))
+            
+            return {
+                "success": True,
+                "is_ai": bool(parsed_verdict.get("is_ai", prob > 0.5)),
+                "unverified": False,
+                "confidence": f"{parsed_verdict.get('confidence', 'High')} (Gemini AI)",
+                "ai_probability": min(max(prob, 0.01), 0.99),
+                "reason": parsed_verdict.get("reason", "Analyzed via Gemini AI live search."),
+                "title": parsed_verdict.get("title", "Track Inspected"),
+                "artist": parsed_verdict.get("artist", "Creator Inspected"),
+                "platform": platform_name,
+                "thumbnail": ""
+            }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> dict:
     """Fetches real track data and executes AI metadata analysis across platforms."""
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
@@ -654,7 +660,13 @@ def inspect_universal_link(url: str, selected_app: str) -> dict:
                 "thumbnail": ""
             }
 
-    # 2. Dispatch real data fetch based on targeted provider
+    # 2. If Gemini API Key is provided, let Gemini investigate the link directly
+    if api_key and api_key.strip():
+        gemini_result = analyze_with_gemini(url, detected_platform, api_key)
+        if gemini_result.get("success"):
+            return gemini_result
+
+    # 3. Dispatch real data fetch based on targeted provider
     if "spotify.com" in domain or selected_app == "Spotify":
         metadata = fetch_spotify_metadata(url)
     elif "youtube.com" in domain or "youtu.be" in domain or selected_app == "YouTube":
@@ -662,21 +674,21 @@ def inspect_universal_link(url: str, selected_app: str) -> dict:
     else:
         metadata = fetch_generic_metadata(url, detected_platform)
 
-    # 3. Handle blocked/unreachable links honestly instead of guessing "Human-Made"
+    # 4. Handle blocked/unreachable links honestly instead of guessing "Human-Made"
     if not metadata.get("success", False):
         return {
             "is_ai": False,
             "unverified": True,
             "confidence": "Low (Blocked)",
             "ai_probability": 0.50,
-            "reason": f"Could not retrieve live page metadata from {detected_platform} (blocked by browser CORS/SSL sandbox or private link). Please download the audio and use 'Audio File Upload' for direct spectral waveform scanning.",
+            "reason": f"Could not retrieve live page metadata from {detected_platform} (blocked by browser CORS/SSL sandbox or private link). Add a Gemini API Key above or use 'Audio File Upload' for direct scanning.",
             "title": metadata.get("title", "Metadata Blocked"),
             "artist": metadata.get("artist", "Unknown"),
             "platform": detected_platform,
             "thumbnail": ""
         }
 
-    # 4. Analyze real retrieved track metadata for generative indicators
+    # 5. Analyze real retrieved track metadata for generative indicators
     raw_text = metadata.get("raw_text", "")
     # Normalize full-width unicode characters (e.g. "ＡＩ" -> "ai")
     normalized_text = raw_text.replace("ａｉ", "ai")
@@ -712,59 +724,6 @@ def inspect_universal_link(url: str, selected_app: str) -> dict:
             "platform": metadata.get("provider", detected_platform),
             "thumbnail": metadata.get("thumbnail", "")
         }
-
-    # 2. Dispatch real data fetch based on targeted provider
-    if "spotify.com" in domain or selected_app == "Spotify":
-        metadata = fetch_spotify_metadata(url)
-    elif "youtube.com" in domain or "youtu.be" in domain or selected_app == "YouTube":
-        metadata = fetch_youtube_metadata(url)
-    else:
-        metadata = fetch_generic_metadata(url, detected_platform)
-
-    # 3. Analyze real retrieved track metadata for generative indicators
-    if metadata.get("success", False) or metadata.get("raw_text"):
-        raw_text = metadata.get("raw_text", "")
-        
-        # Regex check for standalone "AI" markers (e.g. "(AI)", "[AI]", "AI Cover", "#AI")
-        ai_regex_matches = re.findall(r'(?:\b|\(|\[|#)(ai|rvc|suno|udio)(?:\b|\)|\]|#)', raw_text)
-        matched_keywords = [kw for kw in AI_KEYWORDS if kw in raw_text]
-        
-        all_matches = list(dict.fromkeys(matched_keywords + ai_regex_matches))
-        
-        if all_matches:
-            kw_str = ", ".join([f"'{k}'" for k in all_matches[:4]])
-            return {
-                "is_ai": True,
-                "confidence": "High",
-                "ai_probability": 0.94,
-                "reason": f"Live inspection of {metadata.get('provider', detected_platform)} title, description, and tags detected AI markers: {kw_str}.",
-                "title": metadata.get("title", "Track Detected"),
-                "artist": metadata.get("artist", "Artist Detected"),
-                "platform": metadata.get("provider", detected_platform),
-                "thumbnail": metadata.get("thumbnail", "")
-            }
-        else:
-            return {
-                "is_ai": False,
-                "confidence": "High",
-                "ai_probability": 0.12,
-                "reason": f"Live inspection of track metadata on {metadata.get('provider', detected_platform)} confirmed human production signatures without AI flags.",
-                "title": metadata.get("title", "Track Detected"),
-                "artist": metadata.get("artist", "Artist Detected"),
-                "platform": metadata.get("provider", detected_platform),
-                "thumbnail": metadata.get("thumbnail", "")
-            }
-
-    return {
-        "is_ai": False,
-        "confidence": "Medium",
-        "ai_probability": 0.20,
-        "reason": f"Link target verified on {detected_platform} without detected generative metadata tags.",
-        "title": detected_platform + " Track",
-        "artist": "Streaming Creator",
-        "platform": detected_platform,
-        "thumbnail": ""
-    }
 
 input_type = st.radio(
     "Source Type",
@@ -842,7 +801,7 @@ if st.session_state.ad_watched:
         link = user_input.strip()
 
         with st.spinner("Executing live track inspection and fetching song data..."):
-            res = inspect_universal_link(link, selected_platform)
+            res = inspect_universal_link(link, selected_platform, gemini_api_key)
 
         st.markdown("### Analysis Report")
         
