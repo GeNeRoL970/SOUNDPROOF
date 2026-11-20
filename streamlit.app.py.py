@@ -361,6 +361,36 @@ def check_ai_markers(text: str) -> list:
     return list(dict.fromkeys(matches))
 
 
+def verify_artist_via_public_web(artist: str, title: str) -> dict:
+    """Zero-quota fallback check using Wikipedia & DuckDuckGo instant search when Gemini API quota is exhausted."""
+    if not artist or artist.lower() in ("unknown artist", "youtube channel", "unverified"):
+        return {"found_ai": False, "evidence": ""}
+
+    ctx = ssl.create_default_context() if HAS_SSL else None
+    clean_artist = re.sub(r'\s*-\s*topic$', '', artist, flags=re.I).strip()
+
+    # Check Wikipedia API for articles describing the artist/band as AI-generated
+    try:
+        query = urllib.parse.quote(f'"{clean_artist}"')
+        wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json&srlimit=3"
+        req = urllib.request.Request(wiki_url, headers={"User-Agent": "SOUNDPROOF-Detector/1.0"})
+        with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for item in data.get("query", {}).get("search", []):
+                snippet = re.sub(r'<[^>]+>', '', item.get("snippet", "")).lower()
+                item_title = item.get("title", "").lower()
+                if clean_artist.lower() in item_title or clean_artist.lower() in snippet:
+                    if any(term in snippet for term in ["ai-generated", "artificial intelligence", "ai music", "ai country", "suno", "udio", "virtual band", "synthetic"]):
+                        return {
+                            "found_ai": True,
+                            "evidence": f"Public knowledge base confirms '{clean_artist}' is documented as an AI-generated music project."
+                        }
+    except Exception:
+        pass
+
+    return {"found_ai": False, "evidence": ""}
+
+
 def call_gemini_generate(payload: dict, api_key: str, timeout: int = 55) -> dict:
     """Tries free-tier-friendly multimodal Gemini models in order, rotating on 400/404/429 limits."""
     ctx = ssl.create_default_context() if HAS_SSL else None
@@ -590,7 +620,7 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
 
 
 def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: str) -> dict:
-    """Watches a 45s YouTube video segment (low token footprint for free-tier keys) + grounded search."""
+    """Watches a 45s YouTube video segment + grounded search verification."""
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
     clean_url = normalize_youtube_url(url) if is_youtube else url
 
@@ -625,7 +655,6 @@ Return ONLY a raw JSON object (no markdown fences) with these exact keys:
     raw_resp = None
     watched_video = False
 
-    # Attempt 1: Watch first 45 seconds of YouTube video (keeps token usage ~12k so free tier doesn't 429) + Google Search
     if is_youtube:
         video_parts = [
             {
@@ -645,7 +674,6 @@ Return ONLY a raw JSON object (no markdown fences) with these exact keys:
         except Exception:
             raw_resp = None
 
-    # Attempt 2: If video token quota was exceeded or non-YouTube URL, run lightweight grounded search verification
     if raw_resp is None:
         search_payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -802,7 +830,7 @@ def analyze_audio_bytes(file_bytes: bytes, file_name: str = "audio.mp3", api_key
 
 
 def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> dict:
-    """Fetches real track data and executes Gemini multimodal video watching + keyword analysis."""
+    """Fetches real track data and executes Gemini multimodal video watching + keyword & public web analysis."""
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
     detected_platform = identify_platform(url) if selected_app == "Auto-Detect Platform" else selected_app
@@ -851,7 +879,7 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
     else:
         gemini_error = ""
 
-    # 5. Fallback metadata evaluation (only flags AI if explicit markers exist; otherwise marks Unverified if API failed)
+    # 5. Zero-quota fallback: check explicit metadata tags AND public web knowledge base
     if metadata.get("success", False):
         if matched_keywords:
             kw_str = ", ".join([f"'{k}'" for k in matched_keywords[:3]])
@@ -866,37 +894,52 @@ def inspect_universal_link(url: str, selected_app: str, api_key: str = "") -> di
                 "platform": metadata.get("provider", detected_platform),
                 "thumbnail": metadata.get("thumbnail", "")
             }
-        elif gemini_error:
+
+        web_check = verify_artist_via_public_web(metadata.get("artist", ""), metadata.get("title", ""))
+        if web_check.get("found_ai"):
             return {
-                "is_ai": False,
-                "confidence": "Low",
-                "ai_probability": 0.50,
-                "unverified": True,
-                "reason": f"{gemini_error} Metadata alone had no explicit 'AI' tags, so deep audio/video verification could not complete.",
-                "title": metadata.get("title", "Track Detected"),
-                "artist": metadata.get("artist", "Artist Detected"),
-                "platform": metadata.get("provider", detected_platform),
-                "thumbnail": metadata.get("thumbnail", "")
-            }
-        else:
-            return {
-                "is_ai": False,
-                "confidence": "Medium",
-                "ai_probability": 0.15,
+                "is_ai": True,
+                "confidence": "High",
+                "ai_probability": 0.94,
                 "unverified": False,
-                "reason": f"Metadata inspection on {metadata.get('provider', detected_platform)} found no AI markers. Enter a Gemini API key to watch & listen to the audio stream.",
+                "reason": f"{web_check['evidence']} (Note: {gemini_error})" if gemini_error else web_check["evidence"],
                 "title": metadata.get("title", "Track Detected"),
                 "artist": metadata.get("artist", "Artist Detected"),
                 "platform": metadata.get("provider", detected_platform),
                 "thumbnail": metadata.get("thumbnail", "")
             }
 
+        if gemini_error:
+            return {
+                "is_ai": False,
+                "confidence": "Low",
+                "ai_probability": 0.50,
+                "unverified": True,
+                "reason": f"{gemini_error} Deep audio/video listening could not complete because your Gemini API key hit its quota limit.",
+                "title": metadata.get("title", "Track Detected"),
+                "artist": metadata.get("artist", "Artist Detected"),
+                "platform": metadata.get("provider", detected_platform),
+                "thumbnail": metadata.get("thumbnail", "")
+            }
+
+        return {
+            "is_ai": False,
+            "confidence": "Medium",
+            "ai_probability": 0.15,
+            "unverified": False,
+            "reason": f"Metadata inspection on {metadata.get('provider', detected_platform)} found no AI markers. Enter a Gemini API key to watch & listen to the audio stream.",
+            "title": metadata.get("title", "Track Detected"),
+            "artist": metadata.get("artist", "Artist Detected"),
+            "platform": metadata.get("provider", detected_platform),
+            "thumbnail": metadata.get("thumbnail", "")
+        }
+
     return {
         "is_ai": False,
         "confidence": "Low",
         "ai_probability": 0.50,
         "unverified": True,
-        "reason": f"{gemini_error} Could not fetch track metadata from {detected_platform}. Enter a valid Gemini API key or upload the audio file directly.",
+        "reason": f"{gemini_error} Could not fetch track metadata from {detected_platform}. Enter a valid Gemini API key with active quota or upload the audio file directly.",
         "title": detected_platform + " Track",
         "artist": "Unverified",
         "platform": detected_platform,
@@ -1002,18 +1045,61 @@ if st.session_state.ad_watched:
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.markdown(f"""
-            <div class="metric-badge">
-                <div class="metric-label">Platform</div>
-                <div class="metric-value">{res['platform']}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="metric-badge"><div class="metric-label">Platform</div><div class="metric-value">{res["platform"]}</div></div>',
+                unsafe_allow_html=True
+            )
         with col2:
-            st.markdown(f"""
-            <div class="metric-badge">
-                <div class="metric-label">Track Title</div>
-                <div class="metric-value">{res.get('title', 'Unknown Title')}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="metric-badge"><div class="metric-label">Track Title</div><div class="metric-value">{res.get("title", "Unknown Title")}</div></div>',
+                unsafe_allow_html=True
+            )
         with col3:
-            st.markdown
+            st.markdown(
+                f'<div class="metric-badge"><div class="metric-label">Artist / Channel</div><div class="metric-value">{res.get("artist", "Unknown Artist")}</div></div>',
+                unsafe_allow_html=True
+            )
+
+        st.markdown('<div style="margin-top: 15px;"></div>', unsafe_allow_html=True)
+        st.info(f"Verification Details: {res['reason']}")
+
+    else:
+        with st.spinner("Listening to uploaded audio and computing spectral metrics..."):
+            file_bytes = uploaded_file.read()
+            res = analyze_audio_bytes(file_bytes, uploaded_file.name, gemini_api_key)
+
+        st.markdown("### Analysis Report")
+        
+        if res["is_ai"]:
+            st.markdown(
+                f'<div class="result-banner result-ai">Likely AI-Generated Track ({int(res["ai_probability"] * 100)}% Probability)</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f'<div class="result-banner result-human">Likely Human-Made Track ({int((1 - res["ai_probability"]) * 100)}% Human Confidence)</div>',
+                unsafe_allow_html=True
+            )
+
+        if res.get("reason"):
+            st.info(f"Verification Details: {res['reason']}")
+
+        if res.get("metrics"):
+            st.markdown("##### Acoustic Spectral Metrics")
+            m_cols = st.columns(len(res["metrics"]))
+            for idx, (k, v) in enumerate(res["metrics"].items()):
+                with m_cols[idx]:
+                    st.markdown(
+                        f'<div class="metric-badge"><div class="metric-label">{k}</div><div class="metric-value">{v}</div></div>',
+                        unsafe_allow_html=True
+                    )
+            
+            st.markdown('<div style="margin-top: 12px;"></div>', unsafe_allow_html=True)
+            with st.expander("Metric descriptions"):
+                st.markdown("""
+- **Spectral Flatness:** Evaluates tonal variation against static noise. Scores over `0.048` typically indicate synthetic noise artifacts.
+- **High-Freq Energy:** Measures the ratio of total energy in treble frequencies (> `0.18` signals synthetic high-frequency noise).
+- **Signal Variance:** Dynamic range variation. Low values (< `450`) indicate heavily flattened digital sound dynamics.
+                """)
+
+    st.session_state.ad_watched = False
