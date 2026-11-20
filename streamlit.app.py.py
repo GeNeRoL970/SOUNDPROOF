@@ -237,7 +237,7 @@ st.markdown(
 st.markdown(
     """
     <div class="info-card">
-        Real-time multimodal inspector: Gemini watches YouTube videos directly, listens to vocals & instrumentals, and inspects synthetic disclosure flags & spectral signatures.
+        Real-time multimodal inspector: Gemini watches YouTube videos directly, listens to vocals & instrumentals, and cross-checks artist authenticity & spectral signatures.
     </div>
     """,
     unsafe_allow_html=True,
@@ -453,7 +453,6 @@ def fetch_youtube_metadata(url: str) -> dict:
             if kw_match:
                 keywords_str = kw_match.group(1)
 
-            # Check YouTube's official "Altered or synthetic content" disclosure flag in player JSON
             if re.search(r'"isAlteredOrSyntheticContent"\s*:\s*true', html, re.I) or "altered or synthetic content" in html.lower():
                 synthetic_disclosed = True
     except Exception:
@@ -541,8 +540,9 @@ def fetch_generic_metadata(url: str, platform_name: str) -> dict:
 
 
 def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: str) -> dict:
-    """Uses Gemini 2.5 Flash to watch the YouTube video & listen closely to the audio stream."""
+    """Uses Gemini 2.5 Flash to watch the YouTube video & verify artist/track authenticity."""
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={urllib.parse.quote(api_key.strip())}"
+    ctx = ssl.create_default_context() if HAS_SSL else None
 
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
     clean_url = normalize_youtube_url(url) if is_youtube else url
@@ -551,61 +551,77 @@ def analyze_link_with_gemini(url: str, metadata: dict, platform: str, api_key: s
     track_artist = metadata.get("artist", "")
     track_desc = metadata.get("description", "")[:1500]
 
-    prompt = f"""You are a forensic audio & video AI music detector. Watch the attached video and listen critically to the entire song from start to finish.
+    # Step 1: Watch the YouTube video directly via fileData (no mimeType field allowed for YouTube URLs)
+    video_notes = ""
+    if is_youtube:
+        watch_prompt = f"""Watch this YouTube video and listen carefully to the singing and music from start to finish.
+Describe in detail:
+1. What is shown visually in the video (e.g., official live music video with real humans, static AI-generated cover art, looping AI animation, lyric visualizer)?
+2. What does the singing voice and music sound like? Listen closely for AI music generator signatures (Suno v3.5/v4, Udio, RVC voice cloning): metallic vocoder shimmer, robotic/slurred syllables, unnatural breathing, or overly compressed synthetic instruments vs. a real human studio recording.
+3. State clearly whether the audio/video shows signs of being AI-generated or human-performed."""
+
+        watch_payload = {
+            "contents": [{
+                "parts": [
+                    {"fileData": {"fileUri": clean_url}},
+                    {"text": watch_prompt}
+                ]
+            }],
+            "generationConfig": {"temperature": 0.0}
+        }
+
+        watch_req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(watch_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(watch_req, timeout=50, context=ctx) as resp:
+            raw_watch = json.loads(resp.read().decode("utf-8"))
+            for candidate in raw_watch.get("candidates", []):
+                for part in candidate.get("content", {}).get("parts", []):
+                    if "text" in part:
+                        video_notes += part["text"]
+
+    # Step 2: Combine direct video/audio observation with Google Search artist/channel verification
+    verdict_prompt = f"""You are a strict forensic AI music detector. Combine the direct video/audio inspection below with web search verification to determine if this song is AI-generated or a genuine human recording.
 
 URL: {clean_url}
 Platform: {platform}
 Extracted Title: {track_title}
 Extracted Artist/Channel: {track_artist}
-Extracted Description Snippet: {track_desc}
+Description Snippet: {track_desc}
+Direct Video & Audio Observation:
+{video_notes if video_notes else "Non-YouTube link; inspect via web search and metadata."}
 
-DO NOT assume a song is human-made just because the title doesn't say "AI". Many AI songs from Suno v3.5/v4 and Udio are uploaded with normal song titles and AI-generated cover art or looping animations.
+Rules:
+- If the direct video/audio observation detected Suno/Udio/RVC vocal artifacts, slurred AI lyrics, or AI-generated video/cover imagery, set "is_ai": true.
+- If web search reveals the artist/channel is an AI music project, Suno/Udio creator, or has no real human discography/live performances outside AI uploads, set "is_ai": true.
+- Only set "is_ai": false if the track is verified as a real human artist/band recording with natural vocal and acoustic characteristics.
 
-Inspect EVERY clue in the video and audio:
-1. VOCAL & INSTRUMENTAL FORENSICS (Listen closely):
-   - Listen for Suno/Udio signatures: metallic phase-vocoder shimmer on vocals, slightly robotic/auto-tuned pitch glides, unnatural breathless phrasing, slurred consonants, or compressed/washy high-frequency cymbals and synths.
-   - Compare against authentic human studio recordings (like Bruno Mars, Taylor Swift, real bands) which have crisp transient punch, natural room acoustics, and organic vocal dynamics.
-2. VISUAL FORENSICS (Watch the video):
-   - Is the video a static AI-generated illustration/portrait (Midjourney/DALL-E style), a subtle looping AI animation (Kling/Runway/Sora), or a generic visualizer typical of Suno/Udio uploads?
-3. METADATA & ARTIST CHECK:
-   - Look at the channel name, description, and style.
-
-Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
+Return ONLY a raw JSON object (no markdown fences) with these exact keys:
 {{
   "is_ai": true or false,
   "ai_probability": float between 0.05 and 0.99,
   "title": "Exact Song Title",
   "artist": "Artist or Channel Name",
-  "reason": "Specific 2-sentence forensic report detailing what you heard in the vocal/instrumental audio texture and what you saw in the video visuals."
+  "reason": "Specific 2-sentence forensic report explaining what was observed in the video/audio and verified about the artist."
 }}"""
 
-    parts = []
-    if is_youtube:
-        parts.append({
-            "fileData": {
-                "mimeType": "video/mp4",
-                "fileUri": clean_url
-            }
-        })
-    parts.append({"text": prompt})
-
-    payload = {
-        "contents": [{"parts": parts}],
+    verdict_payload = {
+        "contents": [{"parts": [{"text": verdict_prompt}]}],
+        "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.0}
     }
 
-    if not is_youtube:
-        payload["tools"] = [{"google_search": {}}]
-
-    req = urllib.request.Request(
+    verdict_req = urllib.request.Request(
         endpoint,
-        data=json.dumps(payload).encode("utf-8"),
+        data=json.dumps(verdict_payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    ctx = ssl.create_default_context() if HAS_SSL else None
 
-    with urllib.request.urlopen(req, timeout=50, context=ctx) as resp:
+    with urllib.request.urlopen(verdict_req, timeout=45, context=ctx) as resp:
         raw_resp = json.loads(resp.read().decode("utf-8"))
         text_out = ""
         for candidate in raw_resp.get("candidates", []):
@@ -626,6 +642,7 @@ Return ONLY a raw JSON object (no markdown backticks) with these exact keys:
             "title": parsed.get("title") or track_title or "Verified Track",
             "artist": parsed.get("artist") or track_artist or "Verified Artist",
             "platform": platform,
+            "watched_video": bool(video_notes),
             "reason": parsed.get("reason", "Verified via Gemini multimodal video & audio inspection.")
         }
 
@@ -925,7 +942,7 @@ if st.session_state.ad_watched:
     if input_type == "Streaming Link":
         link = user_input.strip()
 
-        with st.spinner("Watching video, listening to audio stream, and inspecting metadata..."):
+        with st.spinner("Watching video, listening to audio stream, and verifying artist..."):
             res = inspect_universal_link(link, selected_platform, gemini_api_key)
 
         st.markdown("### Analysis Report")
